@@ -1,11 +1,13 @@
 package toml2
 
 import (
-	"io"
 	"bytes"
-	"reflect"
 	"fmt"
 	"github.com/pelletier/go-buffruneio"
+	"io"
+	"reflect"
+	"strconv"
+	"unicode"
 )
 
 // Document is the end result of parsing a TOML document. Contains all keys, values,
@@ -53,20 +55,9 @@ func (dec *Decoder) Decode(v interface{}) error {
 	if r == '[' {
 		// TODO: parse table
 	} else if isStartOfKey(r) {
-		key := ""
-		// parse literal key. acts exactly as a literal string
-		if r == '\'' {
-			dec.read() // discard '
-			var err error
-			key, err = dec.parseLiteralString()
-			if err != nil {
-				return fmt.Errorf("toml: key: %s", key)
-			}
-		} else if r == '"' {
-			dec.read() // discard "
-			// TODO: parse double quoted string
-		} else {
-			// TODO: parse dotted key
+		key, err := dec.parseDottedKey()
+		if err != nil {
+			return fmt.Errorf("toml: key: %s", err)
 		}
 
 		// skip separator (whitespace = whitespace)
@@ -85,6 +76,62 @@ func (dec *Decoder) Decode(v interface{}) error {
 	}
 
 	return nil
+}
+
+func (dec *Decoder) parseDottedKey() (string, error) {
+	key, err := dec.parseSimpleKey()
+	if err != nil {
+		return "", err
+	}
+	for {
+		r := dec.peek()
+		if r != '.' {
+			break
+		}
+		dec.read() // read the .
+		keyPart, err := dec.parseSimpleKey()
+		if err != nil {
+			return "", err
+		}
+		key += "." + keyPart
+	}
+	return key, nil
+}
+
+func (dec *Decoder) parseSimpleKey() (string, error) {
+	r := dec.peek()
+	var key string
+	if r == '\'' { // parse literal key. acts exactly as a literal string
+		dec.read() // discard '
+		var err error
+		key, err = dec.parseLiteralString()
+		if err != nil {
+			return "", fmt.Errorf("toml: literal key: %s", err)
+		}
+	} else if r == '"' { // parse quoted key
+		dec.read() // discard "
+		var err error
+		key, err = dec.parseQuotedString()
+		if err != nil {
+			return "", fmt.Errorf("toml: quoted key: %s", err)
+		}
+		if len(key) == 0 {
+			return "", fmt.Errorf("toml: key cannot be empty")
+		}
+	} else { // parse bare key
+		growingString := ""
+		for {
+			r := dec.peek()
+			if isValidBareKeyChar(r) {
+				dec.read()
+				growingString += string(r)
+			} else {
+				break
+			}
+		}
+		key = growingString
+	}
+	return key, nil
 }
 
 func (dec *Decoder) parseLiteralString() (string, error) {
@@ -107,6 +154,82 @@ func (dec *Decoder) parseLiteralString() (string, error) {
 	}
 
 	return growingString, nil
+}
+
+func (dec *Decoder) parseQuotedString() (string, error) {
+	// assumes " has already been read
+	// parses escape characters
+	// does not accept new lines (or any unescaped control char)
+	// reads the last "
+	growingString := ""
+
+	for {
+		r := dec.peek()
+		if r == eof {
+			return "", fmt.Errorf("unifnished string")
+		} else if r == '"' {
+			dec.read()
+			return growingString, nil
+		} else if r == '\\' {
+			dec.read() // read the \ char
+			e := dec.peek()
+			if e == eof {
+				return "", fmt.Errorf("unfishied escape sequence")
+			}
+
+			if e == '"' || e == '\\' || e == '/' || e == 'b' {
+				growingString += string(e)
+			} else if e == 'b' {
+				growingString += "\b"
+			} else if e == 'f' {
+				growingString += "\f"
+			} else if e == 'n' {
+				growingString += "\n"
+			} else if e == 'r' {
+				growingString += "\r"
+			} else if e == 't' {
+				growingString += "\t"
+			} else if e == 'u' {
+				dec.read() // read the u
+				unicodeString, err := dec.parseUnicodeEscapeSequence(4)
+				if err != nil {
+					return "", fmt.Errorf("invalid 4-char unicode escape sequence: %s", err)
+				}
+				growingString += unicodeString
+			} else if e == 'U' {
+				dec.read() // read the U
+				unicodeString, err := dec.parseUnicodeEscapeSequence(8)
+				if err != nil {
+					return "", fmt.Errorf("invalid 8-char unicode escape sequence: %s", err)
+				}
+				growingString += unicodeString
+			}
+		} else if 0x00 <= r && r <= 0x1F {
+			return "", fmt.Errorf("unescaped control character %U", r)
+		} else {
+			dec.read()
+			growingString += string(r)
+		}
+	}
+}
+
+func (dec *Decoder) parseUnicodeEscapeSequence(length int) (string, error) {
+	hexRunes := dec.peekRunes(length)
+	if len(hexRunes) < length || hexRunes[length - 1] == eof {
+		return "", fmt.Errorf("unfinished sequence")
+	}
+	for _, c := range hexRunes {
+		dec.read()
+		if !isHexDigit(c) {
+			return "", fmt.Errorf("incorrect character %c", c)
+		}
+	}
+	code := string(hexRunes)
+	intcode, err := strconv.ParseInt(code, 16, length * 8)
+	if err != nil {
+		return "", fmt.Errorf("invalid: \\u%s", code)
+	}
+	return string(rune(intcode)), nil
 }
 
 const (
@@ -207,4 +330,22 @@ func isStartOfKey(r rune) bool {
 		(r >= '0' && r <= '9') ||
 		r == '-' || r == '_' ||
 		r == '\'' || r == '"' // quoted keys
+}
+
+func isDigit(r rune) bool {
+	return unicode.IsNumber(r)
+}
+
+func isHexDigit(r rune) bool {
+	return isDigit(r) ||
+		(r >= 'a' && r <= 'f') ||
+		(r >= 'A' && r <= 'F')
+}
+
+func isAlphanumeric(r rune) bool {
+	return unicode.IsLetter(r) || r == '_'
+}
+
+func isValidBareKeyChar(r rune) bool {
+	return isAlphanumeric(r) || r == '-' || unicode.IsNumber(r)
 }
